@@ -1,0 +1,206 @@
+// =============================================================================
+// KQL Queries: Find External Tenants YOUR USERS Have Authenticated TO
+// These queries show OUTBOUND access - where your users went externally
+// =============================================================================
+
+// YOUR_TENANT_ID = Your tenant's GUID (replace or filter will work automatically)
+
+// -----------------------------------------------------------------------------
+// 1. Find all external tenants your users have authenticated TO
+// HomeTenantId = YOUR tenant, ResourceTenantId = EXTERNAL tenant
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    SignInCount = count(),
+    UniqueUsers = dcount(UserPrincipalName),
+    FirstAccess = min(TimeGenerated),
+    LastAccess = max(TimeGenerated),
+    SampleUsers = make_set(UserPrincipalName, 5),
+    AppsAccessed = make_set(AppDisplayName, 10)
+    by ResourceTenantId
+| order by SignInCount desc
+
+// -----------------------------------------------------------------------------
+// 2. Detailed view - Which users accessed which external tenants
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    UserDisplayName,
+    HomeTenantId,
+    ResourceTenantId,
+    AppDisplayName,
+    ResourceDisplayName,
+    IPAddress,
+    Location = strcat(location.city, ", ", location.countryOrRegion),
+    Status = iff(ResultType == 0, "Success", "Failed"),
+    ClientAppUsed
+| order by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// 3. Users with most external tenant access (potential risk indicators)
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    ExternalTenantCount = dcount(ResourceTenantId),
+    TotalSignIns = count(),
+    ExternalTenants = make_set(ResourceTenantId, 20),
+    AppsUsed = make_set(AppDisplayName, 10)
+    by UserPrincipalName
+| where ExternalTenantCount > 0
+| order by ExternalTenantCount desc
+
+// -----------------------------------------------------------------------------
+// 4. External tenant access by application
+// Which apps are your users using to access external resources
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    SignInCount = count(),
+    UniqueUsers = dcount(UserPrincipalName),
+    ExternalTenants = make_set(ResourceTenantId, 10)
+    by AppDisplayName
+| order by SignInCount desc
+
+// -----------------------------------------------------------------------------
+// 5. Timeline of external tenant access discovery
+// When did your users first start accessing each external tenant
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(90d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    FirstAccess = min(TimeGenerated),
+    LastAccess = max(TimeGenerated),
+    TotalAccesses = count(),
+    UniqueUsers = dcount(UserPrincipalName)
+    by ResourceTenantId
+| extend DaysSinceFirstAccess = datetime_diff('day', now(), FirstAccess)
+| order by FirstAccess asc
+
+// -----------------------------------------------------------------------------
+// 6. Failed attempts to access external tenants (blocked access)
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| where ResultType != 0
+| summarize
+    FailedAttempts = count(),
+    UniqueUsers = dcount(UserPrincipalName),
+    ErrorCodes = make_set(ResultType, 10),
+    Errors = make_set(ResultDescription, 5)
+    by ResourceTenantId, AppDisplayName
+| order by FailedAttempts desc
+
+// -----------------------------------------------------------------------------
+// 7. Cross-tenant application consent analysis
+// See which external apps your users have consented to
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    AccessCount = count(),
+    UniqueUsers = dcount(UserPrincipalName),
+    Users = make_set(UserPrincipalName, 10)
+    by ResourceTenantId, AppDisplayName, AppId
+| order by AccessCount desc
+
+// -----------------------------------------------------------------------------
+// 8. Non-interactive access to external tenants
+// Service accounts, automation accessing external resources
+// -----------------------------------------------------------------------------
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    SignInCount = count(),
+    UniqueIdentities = dcount(UserPrincipalName),
+    Apps = make_set(AppDisplayName, 10)
+    by ResourceTenantId
+| order by SignInCount desc
+
+// -----------------------------------------------------------------------------
+// 9. External tenant access patterns by day
+// See trends in external access over time
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    AccessCount = count(),
+    UniqueUsers = dcount(UserPrincipalName),
+    UniqueExternalTenants = dcount(ResourceTenantId)
+    by bin(TimeGenerated, 1d)
+| order by TimeGenerated asc
+| render timechart
+
+// -----------------------------------------------------------------------------
+// 10. COMPREHENSIVE: All outbound cross-tenant access
+// -----------------------------------------------------------------------------
+let interactive = SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| extend AuthType = "Interactive"
+| project TimeGenerated, UserPrincipalName, ResourceTenantId, AppDisplayName, AuthType, ResultType;
+let noninteractive = AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| extend AuthType = "NonInteractive"
+| project TimeGenerated, UserPrincipalName, ResourceTenantId, AppDisplayName, AuthType, ResultType;
+union interactive, noninteractive
+| summarize
+    TotalAccesses = count(),
+    SuccessfulAccesses = countif(ResultType == 0),
+    FailedAccesses = countif(ResultType != 0),
+    UniqueUsers = dcount(UserPrincipalName),
+    UniqueApps = dcount(AppDisplayName)
+    by ResourceTenantId
+| order by TotalAccesses desc
+
+// -----------------------------------------------------------------------------
+// 11. Quick summary of your outbound cross-tenant footprint
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    TotalExternalTenants = dcount(ResourceTenantId),
+    TotalOutboundSignIns = count(),
+    UsersAccessingExternal = dcount(UserPrincipalName),
+    ExternalAppsUsed = dcount(AppDisplayName)
+
+// -----------------------------------------------------------------------------
+// 12. Resource-level detail - what resources in external tenants
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where HomeTenantId != ResourceTenantId
+| where isnotempty(ResourceTenantId)
+| summarize
+    AccessCount = count(),
+    UniqueUsers = dcount(UserPrincipalName)
+    by ResourceTenantId, ResourceDisplayName, ResourceId
+| order by AccessCount desc
